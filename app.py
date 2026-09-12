@@ -1,6 +1,9 @@
+import base64
 import csv
 import hashlib
 import io
+import mimetypes
+import tempfile
 import json
 import os
 import random
@@ -12,6 +15,7 @@ from pathlib import Path
 from typing import Literal
 
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -56,6 +60,12 @@ class DefectResult(BaseModel):
     basis: str
     defects: list[LocalizedDefect] = Field(
         description="图片中全部可见缺陷的位置列表；若正常则返回空列表"
+    )
+
+
+class TileLocalizationResult(BaseModel):
+    defects: list[LocalizedDefect] = Field(
+        description="当前高清图块中的全部可见缺陷；没有缺陷时为空列表"
     )
 
 
@@ -270,87 +280,175 @@ def archive_detection(image_bytes, image, marked_image, filename, product_model,
     return row
 
 
-def analyze_image(image: Image.Image) -> tuple[DefectResult, str]:
-    if not API_KEY:
-        raise RuntimeError(
-            "未检测到 GEMINI_API_KEY。请在项目目录的 .env 文件或 Windows 环境变量中配置。"
+
+def get_image_mime(filename: str, uploaded_mime: str | None = None) -> str:
+    if uploaded_mime and uploaded_mime.startswith("image/"):
+        return uploaded_mime
+    guessed, _ = mimetypes.guess_type(filename)
+    if guessed and guessed.startswith("image/"):
+        return guessed
+    return "image/png"
+
+
+def load_original_image(image_bytes: bytes) -> Image.Image:
+    img = Image.open(io.BytesIO(image_bytes))
+    img = ImageOps.exif_transpose(img)
+    return img.convert("RGB")
+
+
+def raw_image_viewer(image_bytes: bytes, mime_type: str, width_px: int, height_px: int, caption: str, viewer_key: str):
+    """直接显示上传文件的原始编码字节，绕过 st.image 媒体处理。"""
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    safe_id = re.sub(r"[^0-9A-Za-z_]+", "_", viewer_key)
+    html = f"""
+    <div style="font-family:Arial,sans-serif;">
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+        <button onclick="fit_{safe_id}()" style="padding:6px 10px;">适应窗口</button>
+        <button onclick="one_{safe_id}()" style="padding:6px 10px;">100% 原始像素</button>
+        <span style="font-size:13px;color:#666;">{caption} · {width_px}×{height_px}px</span>
+      </div>
+      <div id="wrap_{safe_id}" style="width:100%;height:680px;overflow:auto;border:1px solid #ddd;border-radius:8px;background:#111;">
+        <img id="img_{safe_id}" src="data:{mime_type};base64,{b64}" style="display:block;width:100%;max-width:100%;height:auto;" alt="{caption}">
+      </div>
+    </div>
+    <script>
+      function fit_{safe_id}() {{
+        const img=document.getElementById("img_{safe_id}");
+        img.style.width="100%"; img.style.maxWidth="100%"; img.style.height="auto";
+      }}
+      function one_{safe_id}() {{
+        const img=document.getElementById("img_{safe_id}");
+        img.style.width="{width_px}px"; img.style.maxWidth="none"; img.style.height="{height_px}px";
+      }}
+    </script>
+    """
+    components.html(html, height=750, scrolling=False)
+
+
+def _parse_response(response, schema):
+    if getattr(response, "parsed", None) is not None:
+        parsed=response.parsed
+        if isinstance(parsed, schema):
+            return parsed
+        return schema.model_validate(parsed)
+    return schema.model_validate_json(response.text)
+
+
+def gemini_from_original_bytes(client, model_name: str, prompt: str, image_bytes: bytes, mime_type: str, schema):
+    """整图使用上传原始 bytes；>18MB 自动走 Files API。"""
+    if len(image_bytes) <= 18*1024*1024:
+        part=types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+        response=client.models.generate_content(
+            model=model_name,
+            contents=[prompt, part],
+            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=schema),
         )
+        return _parse_response(response, schema)
 
-    client = genai.Client(api_key=API_KEY)
+    suffix=mimetypes.guess_extension(mime_type) or ".png"
+    temp_path=None; remote=None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(image_bytes); temp_path=tmp.name
+        remote=client.files.upload(file=temp_path)
+        response=client.models.generate_content(
+            model=model_name,
+            contents=[prompt, remote],
+            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=schema),
+        )
+        return _parse_response(response, schema)
+    finally:
+        if temp_path:
+            try: Path(temp_path).unlink(missing_ok=True)
+            except Exception: pass
+        if remote is not None and getattr(remote, "name", None):
+            try: client.files.delete(name=remote.name)
+            except Exception: pass
 
-    prompt = """
-你是一名注塑件外观质量检测助手。请同时完成“缺陷分类”和“缺陷定位”。
-只根据上传图片中可见的表面特征做判断，不要虚构不可见的工艺信息。
 
-允许的缺陷类型只有：
-正常、黑点、白点、划伤、擦伤、指印。
+def _iou(a,b):
+    ay1,ax1,ay2,ax2=a; by1,bx1,by2,bx2=b
+    iy1,ix1=max(ay1,by1),max(ax1,bx1); iy2,ix2=min(ay2,by2),min(ax2,bx2)
+    ih,iw=max(0,iy2-iy1),max(0,ix2-ix1); inter=ih*iw
+    if inter<=0: return 0.0
+    aa=max(0,ay2-ay1)*max(0,ax2-ax1); bb=max(0,by2-by1)*max(0,bx2-bx1)
+    u=aa+bb-inter
+    return inter/u if u>0 else 0.0
 
-请严格遵守：
-1. defect_type：整张图片的主要缺陷类型，只能从上述六类选择一个；若未发现明显缺陷则为“正常”。
-2. severity：只能为“轻微 / 一般 / 严重”。
-3. confidence：0-100 整数，表示对整张图主要结论的置信度。
-4. basis：用简短中文说明整张图的视觉判断依据。
-5. defects：列出图片中所有明显缺陷位置。如果判断为正常，必须返回空列表 []。
-6. defects 中每个元素：
-   - defect_type：只能是 黑点、白点、划伤、擦伤、指印，不允许写“正常”；
-   - confidence：0-100 整数；
-   - box_2d：必须是 [ymin, xmin, ymax, xmax]，四个值都归一化到 0-1000；
-   - description：简短描述这个框内看到了什么。
-7. 边界框应尽量紧贴缺陷本身，不要框住整件产品，也不要把大面积正常区域包含进去。
-8. 同一张图如存在多个缺陷，请分别给出多个框；不要只定位一个。
-9. 图片不清晰、缺陷不明显或位置不确定时，应降低置信度。
+
+def deduplicate_defects(defects: list[LocalizedDefect]) -> list[LocalizedDefect]:
+    kept=[]
+    for d in sorted(defects,key=lambda x:x.confidence,reverse=True):
+        if any(d.defect_type==k.defect_type and _iou(d.box_2d,k.box_2d)>=0.45 for k in kept):
+            continue
+        kept.append(d)
+    return kept
+
+
+def hd_tile_localization(image: Image.Image, client, model_name: str, tile_size: int=1536, overlap: int=256) -> list[LocalizedDefect]:
+    width,height=image.size
+    if width<=tile_size and height<=tile_size: return []
+    prompt="""
+你是一名注塑件表面缺陷定位助手。当前输入是一张大图的高清局部图块。
+只定位：黑点、白点、划伤、擦伤、指印。不要把正常纹理、结构边缘、背景、反光当成缺陷。
+返回 defects 数组，每个元素包含 defect_type、confidence、box_2d=[ymin,xmin,ymax,xmax](当前图块0-1000)、description。
+没有明确缺陷则返回空数组，框要紧贴缺陷。
 """
+    step=max(256,tile_size-overlap)
+    def starts(total):
+        vals=list(range(0,max(1,total-tile_size+1),step)); last=max(0,total-tile_size)
+        if not vals or vals[-1]!=last: vals.append(last)
+        return sorted(set(vals))
+    merged=[]
+    for top in starts(height):
+        for left in starts(width):
+            tile=image.crop((left,top,min(width,left+tile_size),min(height,top+tile_size)))
+            buf=io.BytesIO(); tile.save(buf,format="PNG",optimize=False); tile_bytes=buf.getvalue()
+            tr=gemini_from_original_bytes(client,model_name,prompt,tile_bytes,"image/png",TileLocalizationResult)
+            tw,th=tile.size
+            for d in tr.defects:
+                y1,x1,y2,x2=[max(0,min(1000,int(v))) for v in d.box_2d]
+                gx1=left+(x1/1000.0)*tw; gy1=top+(y1/1000.0)*th
+                gx2=left+(x2/1000.0)*tw; gy2=top+(y2/1000.0)*th
+                box=[int(round(gy1/height*1000)),int(round(gx1/width*1000)),int(round(gy2/height*1000)),int(round(gx2/width*1000))]
+                merged.append(LocalizedDefect(defect_type=d.defect_type,confidence=d.confidence,box_2d=box,description=d.description))
+    return deduplicate_defects(merged)
 
-    # 保持现有项目的模型回退逻辑。
-    model_candidates = [
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
-        "gemini-3.8-flash",
-    ]
 
-    retryable = ("503", "UNAVAILABLE", "high demand", "429", "RESOURCE_EXHAUSTED")
-    skippable = ("404", "NOT_FOUND", "no longer available")
-    errors = []
+def analyze_image(image: Image.Image, image_bytes: bytes, mime_type: str, hd_tile_mode: bool=False) -> tuple[DefectResult, str]:
+    if not API_KEY:
+        raise RuntimeError("未检测到 GEMINI_API_KEY。请在本地 .env 或 Streamlit Cloud Secrets 中配置。")
 
-    for model_name in model_candidates:
+    client=genai.Client(api_key=API_KEY)
+    prompt="""
+你是一名注塑件外观质量检测助手。请完成缺陷分类与定位。
+只根据图片可见特征判断，不要虚构工艺信息。
+允许类型：正常、黑点、白点、划伤、擦伤、指印。
+输出：defect_type、severity(轻微/一般/严重)、confidence(0-100)、basis、defects。
+defects 中每个元素包含 defect_type、confidence、box_2d=[ymin,xmin,ymax,xmax](0-1000)、description。
+正常时 defects=[]；多个缺陷分别定位，框要紧贴缺陷。
+"""
+    models=["gemini-3.6-flash","gemini-3.5-flash","gemini-3.5-flash-lite","gemini-3.8-flash"]
+    retryable=("503","UNAVAILABLE","high demand","429","RESOURCE_EXHAUSTED")
+    skippable=("404","NOT_FOUND","no longer available")
+    errors=[]
+    for model_name in models:
         for attempt in range(3):
             try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=[prompt, image],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=DefectResult,
-                    ),
-                )
-
-                if getattr(response, "parsed", None) is not None:
-                    parsed = response.parsed
-                    if isinstance(parsed, DefectResult):
-                        return parsed, model_name
-                    return DefectResult.model_validate(parsed), model_name
-
-                return DefectResult.model_validate_json(response.text), model_name
-
+                result=gemini_from_original_bytes(client,model_name,prompt,image_bytes,mime_type,DefectResult)
+                if hd_tile_mode and max(image.size)>=1800:
+                    td=hd_tile_localization(image,client,model_name)
+                    if td: result.defects=deduplicate_defects(list(result.defects)+td)
+                return result,model_name
             except Exception as e:
-                msg = str(e)
-                errors.append(f"{model_name} 第{attempt+1}次：{msg}")
-
-                if any(x in msg for x in skippable):
-                    break
-
+                msg=str(e); errors.append(f"{model_name} 第{attempt+1}次：{msg}")
+                if any(x in msg for x in skippable): break
                 if any(x in msg for x in retryable):
-                    if attempt < 2:
-                        time.sleep(1.5 * (2 ** attempt))
-                        continue
+                    if attempt<2:
+                        time.sleep(1.5*(2**attempt)); continue
                     break
-
                 raise
-
-    raise RuntimeError(
-        "当前 Gemini 服务暂时无法完成请求。最近错误：\n" + "\n".join(errors[-4:])
-    )
+    raise RuntimeError("当前 Gemini 服务暂时无法完成请求。最近错误：\n"+"\n".join(errors[-4:]))
 
 
 def make_seed(image_bytes: bytes, defect_type: str, severity: str, material: str, model: str, nonce: int):
@@ -471,7 +569,7 @@ def make_text_report(filename, product_model, material, result, diagnosis, used_
 
 
 st.title("注塑件表面缺陷 AI 检测系统")
-st.caption("AI 自动识别 + 缺陷定位标记 + 动态原因分析 + 自动分类整理 + 历史记录 + 报告导出")
+st.caption("原始字节直传 + 100%原像素查看 + 高清分块定位 + 缺陷标记 + 原因分析 + 自动分类整理")
 
 tab1, tab2, tab3, tab4 = st.tabs(["单张检测", "批量检测", "分类整理", "历史记录"])
 
@@ -488,16 +586,29 @@ with tab1:
         )
         image = None
         image_bytes = b""
+        image_mime = "image/png"
         if uploaded_file is not None:
             image_bytes = uploaded_file.getvalue()
-            image = Image.open(io.BytesIO(image_bytes))
-            image = ImageOps.exif_transpose(image).convert("RGB")
-            st.image(image, caption="原始图片", use_container_width=True)
+            image_mime = get_image_mime(uploaded_file.name, getattr(uploaded_file, "type", None))
+            image = load_original_image(image_bytes)
+            size_mb = len(image_bytes) / (1024 * 1024)
+            sha256 = hashlib.sha256(image_bytes).hexdigest()
+            st.caption(f"文件：{uploaded_file.name} ｜ {image.width}×{image.height}px ｜ {size_mb:.2f} MB")
+            st.caption(f"SHA-256：{sha256[:20]}… ｜ 下方直接显示上传文件原始编码字节")
+            raw_image_viewer(image_bytes, image_mime, image.width, image.height, "原始文件直显", f"raw_{sha256[:12]}")
+            st.download_button("下载并校验原始上传文件", data=image_bytes, file_name=uploaded_file.name, mime=image_mime, key="download_uploaded_original")
 
     with c2:
         st.subheader("产品信息")
         material = st.text_input("材料（可选）", placeholder="例如：ABS", key="single_material")
         product_model = st.text_input("产品型号（可选）", placeholder="例如：A-001", key="single_model")
+
+        hd_tile_mode = st.checkbox(
+            "高清分块检测（2K/4K、小缺陷建议开启）",
+            value=True,
+            help="保持原始像素切片定位，不先缩小整张图。会增加 API 调用次数。",
+            key="single_hd_tile",
+        )
 
         detect = st.button(
             "开始 AI 检测",
@@ -510,7 +621,7 @@ with tab1:
     if detect:
         try:
             with st.spinner("AI 正在识别缺陷类型并定位缺陷位置……"):
-                result, used_model = analyze_image(image)
+                result, used_model = analyze_image(image, image_bytes, image_mime, hd_tile_mode=hd_tile_mode)
                 marked_image = annotate_image(image, result)
                 marked_bytes = image_to_png_bytes(marked_image)
                 archive_row = archive_detection(
@@ -552,10 +663,13 @@ with tab1:
             st.header("检测结果")
 
             st.subheader("缺陷定位标记")
-            st.image(
-                marked_image,
-                caption="红框及编号为 Gemini 返回的缺陷位置；编号与下表对应",
-                use_container_width=True,
+            raw_image_viewer(
+                last["marked_bytes"],
+                "image/png",
+                marked_image.width,
+                marked_image.height,
+                "标记图",
+                f"marked_{last['image_hash'][:12]}",
             )
 
             if result.defects:
@@ -675,9 +789,9 @@ with tab2:
         for idx, file in enumerate(batch_files, 1):
             try:
                 file_bytes = file.getvalue()
-                img = Image.open(io.BytesIO(file_bytes))
-                img = ImageOps.exif_transpose(img).convert("RGB")
-                result, used_model = analyze_image(img)
+                file_mime = get_image_mime(file.name, getattr(file, "type", None))
+                img = load_original_image(file_bytes)
+                result, used_model = analyze_image(img, file_bytes, file_mime, hd_tile_mode=False)
                 marked_img = annotate_image(img, result)
                 diagnosis = build_diagnosis(
                     result.defect_type,

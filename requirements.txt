@@ -1,4 +1,4 @@
-streamlit>=1.38
+streamlit>=1.55
 Pillow>=10.0
 google-genai>=1.45
 pydantic>=2.0
